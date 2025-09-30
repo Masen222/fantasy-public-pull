@@ -1,0 +1,17 @@
+# venv & Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# data (keep folders via .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# secrets
+.env
+/secrets
