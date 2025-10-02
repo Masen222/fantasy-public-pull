@@ -265,6 +265,19 @@ def main():
     scoring_df = _load_scoring(season)
     weights = _build_weight_config(scoring_df)
 
+    # --- DEBUG: show key weights we will use ---
+    if os.getenv("DEBUG_POINTS", "").strip() == "1":
+        keyw = {k: weights.get(k) for k in ["pass_yds","rush_yds","rec_yds","rec_rec","pass_td","rush_td","rec_td","pass_int","xp_made","fum_lost"]}
+        print("\n🔎 Effective weights:", {k: round(v, 4) if v is not None else None for k, v in keyw.items()})
+
+    # --- Guardrail: clamp obviously-wrong per-yard weights (mis-parsed scoring) ---
+    _defaults = {"pass_yds": 0.04, "rush_yds": 0.10, "rec_yds": 0.10}
+    for k in ("pass_yds", "rush_yds", "rec_yds"):
+        w = float(weights.get(k, _defaults[k]))
+        if w > 0.5:  # >0.5 pts/yd would be wildly off (e.g., 6.0 = TD value)
+            print(f"⚠️  Per-yard weight {k}={w} looks unreasonable; forcing {_defaults[k]}.")
+            weights[k] = _defaults[k]
+
     # Compute subtotal components
     pts_pass = (
         _safe(wide, "pass_yds") * weights.get("pass_yds", 0.0)
