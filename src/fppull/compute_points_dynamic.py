@@ -171,6 +171,37 @@ def _build_weight_config(scoring_df: pd.DataFrame) -> Dict[str, float]:
 def _safe(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0.0)
 
+def _rescale_wide_sanity(wide: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect and downscale implausible stat magnitudes in the wide table.
+    Some feeds log yards/receiving in tenths or hundredths, causing players
+    to show 300–600+ 'points'. We fix this by applying plausible ceilings.
+    """
+    rescaled = wide.copy()
+
+    # Define plausible maxima per player-week
+    ceilings = {
+        "pass_yds": 700.0,
+        "rush_yds": 300.0,
+        "rec_yds": 300.0,
+        "rec_rec": 25.0,
+        "pass_td": 10.0,
+        "rush_td": 6.0,
+        "rec_td": 6.0,
+    }
+
+    for col, ceiling in ceilings.items():
+        if col in rescaled.columns:
+            s = pd.to_numeric(rescaled[col], errors="coerce").fillna(0.0)
+            if (s > ceiling).mean() > 0.5:  # >50% rows implausible
+                factor = 10.0
+                while (s > ceiling).mean() > 0.1 and factor <= 1000:
+                    s = s / factor
+                    factor *= 10
+                print(f"⚠️  Auto-rescaled {col} by factor {factor/10:.0f} for plausibility.")
+            rescaled[col] = s
+
+    return rescaled
 
 def main():
     season = _load_env()
@@ -181,6 +212,9 @@ def main():
         print(f"Missing wide CSV: {wide_path}. Run build_player_week_wide.py first.", file=sys.stderr)
         sys.exit(1)
     wide = pd.read_csv(wide_path)
+
+    # Auto-rescale stats to prevent inflated totals
+    wide = _rescale_wide_sanity(wide)
 
     # === BEGIN: week-level normalization (dedupe + sanity) ===
     # Goal: ensure ONE row per (season, week, team_abbr, athlete_name) before computing points.
