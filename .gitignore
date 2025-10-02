@@ -15,3 +15,6 @@ data/processed/*
 # secrets
 .env
 /secrets
+
+# Local ESPN cookie file
+secrets/espn.cookie
