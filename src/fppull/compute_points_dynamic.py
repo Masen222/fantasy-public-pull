@@ -1,21 +1,20 @@
 # src/fppull/compute_points_dynamic.py
 """
-Compute player fantasy points from public wide stats, but load weights
+Compute player fantasy points from public wide stats, loading weights
 dynamically from ESPN league scoring (scoring_table.csv).
 
-Current coverage (per available public wide stats):
+Coverage (given current wide schema):
 - Passing: yards, TD, INT
 - Rushing: yards, TD
 - Receiving: receptions, yards, TD
-- Fumbles lost (if available)
-- Kicker XP made (if available in wide)
-- Kicker FG made (no distance buckets yet — flagged as unsupported)
+- Fumbles lost
+- Kicker XP made (FG buckets intentionally not applied yet)
 
-Not yet covered (flagged; will be added next iteration):
-- FG distance buckets (0-39, 40-49, 50-59, 60+) and FG missed
-- 2-pt conversions (pass/rush/rec)
-- DST/Team Defense stats
-- Return TD variants (KRTD, PRTD, etc.)
+Normalization:
+- Coerce numeric columns
+- Collapse to one row per (season, week, team_abbr, athlete_name) using MAX
+  (handles cumulative/incremental feeds without inflating totals)
+- Detect yardage stored in tenths and downscale by 10
 
 Outputs:
 - data/processed/season_{SEASON}/player_week_points.csv
@@ -27,54 +26,59 @@ Usage:
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import pandas as pd
 from dotenv import load_dotenv
 
+# -----------------------------------------------------------------------------
+# Paths / constants
+# -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
-PROC = ROOT / "data" / "processed"
-
 IN_WIDE_TPL = "data/processed/season_{season}/player_week_stats_wide.csv"
 IN_SCORING_TPL = "data/processed/season_{season}/espn/scoring_table.csv"
 OUT_POINTS_TPL = "data/processed/season_{season}/player_week_points.csv"
 
-# --- Minimal mapping from ESPN statId -> our internal wide-stat keys or roles ---
-# NOTE: These ids are commonly seen; your league's ids may differ. We match dynamically
-# by ids found in scoring_table.csv; unknown ids are reported.
-STATID_TO_METRIC = {
+# Minimal mapping from ESPN statId -> our internal wide-stat keys or roles
+STATID_TO_METRIC: Dict[int, tuple[str, str, float]] = {
     # Passing
-    3:  ("pass_yds", "per_unit", 1.0),   # we will multiply by the points value per yard
-    25: ("pass_td",  "count",   1.0),
-    26: ("pass_int", "count",   1.0),
-    29: ("pass_2pt", "count",   1.0),    # not present in wide yet (placeholder)
+    3:  ("pass_yds", "per_unit", 1.0),
+    25: ("pass_td",  "count",    1.0),
+    26: ("pass_int", "count",    1.0),
     # Rushing
     24: ("rush_yds", "per_unit", 1.0),
-    27: ("rush_td",  "count",   1.0),
-    32: ("rush_2pt", "count",   1.0),    # placeholder; not in wide yet
+    27: ("rush_td",  "count",    1.0),
     # Receiving
-    42: ("rec_rec",  "count",   1.0),    # receptions (PPR)
+    42: ("rec_rec",  "count",    1.0),
     43: ("rec_yds",  "per_unit", 1.0),
-    44: ("rec_td",   "count",   1.0),
-    45: ("rec_2pt",  "count",   1.0),    # placeholder; not in wide yet
+    44: ("rec_td",   "count",    1.0),
     # Fumbles
-    52: ("fum_lost", "count",   1.0),
-    # Kicking (placeholders — our wide has only total FGM/XP, not distance buckets)
-    86: ("xp_made",  "count",   1.0),
-    # FG buckets (unsupported for now — we’ll flag if present in scoring):
-    # 74: FG 0-39, 77: FG 40-49, 80: FG 50-59, 83: FG 60+, 88: FG Missed
+    52: ("fum_lost", "count",    1.0),
+    # Kicking (only XP supported in current wide)
+    86: ("xp_made",  "count",    1.0),
+    # NOTE: FG buckets (74,77,80,83,88) not applied until wide supports distance bins
 }
 
-# Keys present in our public wide table
-WIDE_COLUMNS = {
+WIDE_NUMERIC_COLS: List[str] = [
+    # passing
     "pass_yds", "pass_td", "pass_int",
+    # rushing
     "rush_yds", "rush_td",
+    # receiving
     "rec_rec", "rec_yds", "rec_td",
+    # misc
     "fum_lost",
-    "k_fgm", "k_fga", "xp_made", "xp_att"
-}
+    # kicking (coarse)
+    "xp_made", "xp_att", "k_fgm", "k_fga",
+]
+
+YARD_COLS = ["pass_yds", "rush_yds", "rec_yds"]
+KEY_COLS = ["season", "week", "team_abbr", "athlete_name"]  # do NOT include 'position' in grouping
 
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def _load_env() -> int:
     load_dotenv(ROOT / ".env")
     s = os.getenv("SEASON", "").strip()
@@ -94,11 +98,9 @@ def _load_scoring(season: int) -> pd.DataFrame:
         print(f"⚠️  {scoring_path} not found. Run fetch_espn_scoring.py first.", file=sys.stderr)
         sys.exit(1)
     df = pd.read_csv(scoring_path)
-    # Normalize expected columns
     if "statId" not in df.columns or "points" not in df.columns:
         print("⚠️  scoring_table.csv missing required columns [statId, points].", file=sys.stderr)
         sys.exit(1)
-    # Keep only numeric statId rows
     df = df[pd.to_numeric(df["statId"], errors="coerce").notnull()].copy()
     df["statId"] = df["statId"].astype(int)
     df["points"] = pd.to_numeric(df["points"], errors="coerce").fillna(0.0)
@@ -106,230 +108,185 @@ def _load_scoring(season: int) -> pd.DataFrame:
 
 
 def _build_weight_config(scoring_df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Translate ESPN statId weights into a dict keyed by our 'wide' metric names.
-      - 'per_unit' stats (yards): keep raw points as per-yard factor (e.g., 0.04)
-      - 'count' stats (TD/INT/etc.): keep raw points per event
-    We ignore items that map to placeholders not present in the wide CSV (2PT, FG buckets).
-    """
+    """Translate ESPN statId weights into a dict keyed by our 'wide' metric names."""
     weights: Dict[str, float] = {}
-
-    unsupported: Dict[int, float] = {}
-    unknown: Dict[int, float] = {}
+    unknown = []
 
     for _, row in scoring_df.iterrows():
         sid = int(row["statId"])
         pts = float(row["points"])
         meta = STATID_TO_METRIC.get(sid)
         if not meta:
-            # Unknown to our mapper — keep list so we can decide next step
-            unknown[sid] = pts
+            unknown.append(sid)
             continue
-
         metric, mode, scale = meta
-        if metric not in WIDE_COLUMNS:
-            # Placeholder or not-yet-parsed column
-            unsupported[sid] = pts
+        if mode not in ("per_unit", "count"):
             continue
+        weights[metric] = pts * scale
 
-        if mode == "per_unit":
-            weights[metric] = pts * scale
-        else:
-            weights[metric] = pts * scale
-
-    # Console diagnostics (short, clear)
-    if unsupported:
-        print("⚠️  Scoring items present but not supported by current wide schema:")
-        for sid, pts in sorted(unsupported.items()):
-            print(f"    • statId {sid}: weight={pts}  (needs additional parsing; e.g., 2PT or FG buckets)")
     if unknown:
-        # Quite normal — leagues often have many statIds we don't need for player offense
         print("ℹ️  Scoring statIds not used in this compute (unknown mapping):")
-        print("    ", ", ".join(str(s) for s in sorted(unknown.keys())))
+        print("    ", ", ".join(str(s) for s in sorted(set(unknown))))
 
-    # Fallback defaults for any commonly expected metric not provided in scoring
-    # (use PPR baseline so compute never crashes)
+    # Safe defaults so compute never crashes if some keys missing
     defaults = {
-        "pass_yds": 0.04,
-        "pass_td": 4.0,
-        "pass_int": -2.0,
-        "rush_yds": 0.1,
-        "rush_td": 6.0,
-        "rec_rec": 1.0,
-        "rec_yds": 0.1,
-        "rec_td": 6.0,
+        "pass_yds": 0.04, "pass_td": 4.0, "pass_int": -2.0,
+        "rush_yds": 0.1,  "rush_td": 6.0,
+        "rec_rec": 1.0,   "rec_yds": 0.1, "rec_td": 6.0,
         "fum_lost": -2.0,
-        "xp_made": 1.0,     # sane default
-        # "k_fgm": 3.0  # we cannot honor distance buckets yet; leave out to avoid double-counting
+        "xp_made": 1.0,
     }
     for k, v in defaults.items():
         weights.setdefault(k, v)
-
     return weights
 
 
 def _safe(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0.0)
 
-def _rescale_wide_sanity(wide: pd.DataFrame) -> pd.DataFrame:
+
+def _ensure_columns(wide: pd.DataFrame) -> pd.DataFrame:
+    """Ensure required columns exist and are properly typed."""
+    w = wide.copy()
+
+    # ID columns
+    for k in KEY_COLS:
+        if k not in w.columns:
+            w[k] = ""
+        w[k] = w[k].fillna("").astype(str)
+
+    # optional position column (not part of key)
+    if "position" not in w.columns:
+        w["position"] = ""
+
+    # numeric columns
+    for c in WIDE_NUMERIC_COLS:
+        if c not in w.columns:
+            w[c] = 0.0
+        w[c] = pd.to_numeric(w[c], errors="coerce").fillna(0.0)
+
+    return w
+
+
+def _collapse_player_weeks(wide: pd.DataFrame) -> pd.DataFrame:
     """
-    Detect and downscale implausible stat magnitudes in the wide table.
-    Some feeds log yards/receiving in tenths or hundredths, causing players
-    to show 300–600+ 'points'. We fix this by applying plausible ceilings.
+    Collapse to ONE row per (season, week, team_abbr, athlete_name) by taking MAX of
+    numeric columns, which matches final box totals for cumulative feeds.
     """
-    rescaled = wide.copy()
+    try:
+        return (wide.groupby(KEY_COLS, as_index=False, dropna=False)[WIDE_NUMERIC_COLS].max())
+    except TypeError:
+        # Older pandas without dropna= argument
+        return (wide.groupby(KEY_COLS, as_index=False)[WIDE_NUMERIC_COLS].max())
 
-    # Define plausible maxima per player-week
-    ceilings = {
-        "pass_yds": 700.0,
-        "rush_yds": 300.0,
-        "rec_yds": 300.0,
-        "rec_rec": 25.0,
-        "pass_td": 10.0,
-        "rush_td": 6.0,
-        "rec_td": 6.0,
-    }
 
-    for col, ceiling in ceilings.items():
-        if col in rescaled.columns:
-            s = pd.to_numeric(rescaled[col], errors="coerce").fillna(0.0)
-            if (s > ceiling).mean() > 0.5:  # >50% rows implausible
-                factor = 10.0
-                while (s > ceiling).mean() > 0.1 and factor <= 1000:
-                    s = s / factor
-                    factor *= 10
-                print(f"⚠️  Auto-rescaled {col} by factor {factor/10:.0f} for plausibility.")
-            rescaled[col] = s
+def _normalize_yard_units(wide: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect yardage stored in tenths (common in some public feeds) and divide by 10.
+    Heuristic: if any yardage column's max > 1000 for a single player-week, treat as tenths.
+    """
+    w = wide.copy()
+    try:
+        yard_max = max(float(w[c].max()) for c in YARD_COLS if c in w.columns)
+    except Exception:
+        yard_max = 0.0
 
-    return rescaled
+    if yard_max > 1000.0:
+        for c in YARD_COLS:
+            if c in w.columns:
+                w[c] = pd.to_numeric(w[c], errors="coerce").fillna(0.0) / 10.0
+        print("🔧 Normalized yardage columns from tenths → yards (÷10).")
+    return w
 
+
+def _debug_preview(tag: str, df: pd.DataFrame, cols: list[str]) -> None:
+    if os.getenv("DEBUG_POINTS", "").strip() != "1":
+        return
+    try:
+        print(f"\n🔎 DEBUG {tag}:")
+        print(df[cols].head(12).to_string(index=False))
+    except Exception as e:
+        print(f"⚠️ DEBUG preview failed: {e}")
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 def main():
     season = _load_env()
 
-    # Input tables
+    # Load inputs
     wide_path = ROOT / IN_WIDE_TPL.format(season=season)
     if not wide_path.exists():
         print(f"Missing wide CSV: {wide_path}. Run build_player_week_wide.py first.", file=sys.stderr)
         sys.exit(1)
-    wide = pd.read_csv(wide_path)
+    wide_raw = pd.read_csv(wide_path)
 
-    # Auto-rescale stats to prevent inflated totals
-    wide = _rescale_wide_sanity(wide)
+    # Normalize schema + types
+    wide = _ensure_columns(wide_raw)
 
-    # === BEGIN: week-level normalization (dedupe + sanity) ===
-    # Goal: ensure ONE row per (season, week, team_abbr, athlete_name) before computing points.
-    # Many feeds are cumulative/incremental; taking MAX per stat per player-week
-    # matches the final box total and prevents overcounting.
+    # Collapse duplicates (cumulative feeds) → one row per player-week
+    wide = _collapse_player_weeks(wide)
 
-    # 1) Identify key + numeric columns
-    _key = ["season", "week", "team_abbr", "athlete_name"]  # don't include 'position' here
-    _numeric_cols = [
-        # passing
-        "pass_yds", "pass_td", "pass_int",
-        # rushing
-        "rush_yds", "rush_td",
-        # receiving
-        "rec_rec", "rec_yds", "rec_td",
-        # misc
-        "fum_lost",
-        # kicking (coarse)
-        "xp_made", "xp_att", "k_fgm", "k_fga",
-    ]
+    # Ensure optional 'position' column exists after collapse (groupby drops non-numeric)
+    if "position" not in wide.columns:
+        wide["position"] = ""
+    else:
+        wide["position"] = wide["position"].fillna("").astype(str)
 
-    # Ensure required columns exist
-    for c in _numeric_cols:
-        if c not in wide.columns:
-            wide[c] = 0.0
+    # Yardage unit normalization (tenths → yards)
+    wide = _normalize_yard_units(wide)
 
-    # Make sure ID columns exist and are strings
-    for k in _key:
-        if k not in wide.columns:
-            wide[k] = ""
-        wide[k] = wide[k].fillna("").astype(str)
+    # Extra diagnostics: show top raw yardage leaders to confirm plausibility
+    if os.getenv("DEBUG_POINTS", "").strip() == "1":
+        def _show_top(df, col, extra_cols=None, n=10):
+            extra_cols = extra_cols or []
+            keep = [c for c in (["season","week","team_abbr","athlete_name",col] + extra_cols) if c in df.columns]
+            try:
+                print(f"\n🔎 Top {n} by {col}:")
+                print(df.sort_values(col, ascending=False)[keep].head(n).to_string(index=False))
+            except Exception as e:
+                print(f"⚠️ DEBUG top-{col} failed: {e}")
 
-    # Coerce numeric for stable max()
-    for c in _numeric_cols:
-        wide[c] = pd.to_numeric(wide[c], errors="coerce").fillna(0.0)
+        # Print tops after normalization, before scoring, so we see raw inputs
+        if "rec_yds" in wide.columns:
+            _show_top(wide, "rec_yds", extra_cols=["rec_rec"])
+        if "rec_rec" in wide.columns:
+            _show_top(wide, "rec_rec", extra_cols=["rec_yds"])
+        if "rush_yds" in wide.columns:
+            _show_top(wide, "rush_yds")
+        if "pass_yds" in wide.columns:
+            _show_top(wide, "pass_yds")
 
-    # 2) Collapse to one row per player-week using MAX across duplicates
-    try:
-        wide = (
-            wide.groupby(_key, as_index=False, dropna=False)[_numeric_cols]
-                .max()
-        )
-    except TypeError:
-        # Older pandas without dropna=; keys have no NaN due to fillna above.
-        wide = (
-            wide.groupby(_key, as_index=False)[_numeric_cols]
-                .max()
-        )
+    # Optional debug preview
+    _debug_preview("player-week (post-normalization)", wide, KEY_COLS + ["pass_yds","rush_yds","rec_rec","rec_yds"])
 
-    # 3) Sanity warnings (non-fatal)
-    _suspicious = wide[
-        (("rec_yds"  in wide.columns) & (wide["rec_yds"]  > 300)) |
-        (("rec_rec"  in wide.columns) & (wide["rec_rec"]  > 25))  |
-        (("rush_yds" in wide.columns) & (wide["rush_yds"] > 300)) |
-        (("pass_yds" in wide.columns) & (wide["pass_yds"] > 700))
-    ]
-    if len(_suspicious) > 0:
-        print(f"⚠️  Sanity: {len(_suspicious)} player-week rows exceed plausible ranges after MAX-normalization. Example:")
-        try:
-            print(_suspicious[_key + ["pass_yds","rush_yds","rec_rec","rec_yds"]].head(8).to_string(index=False))
-        except Exception:
-            pass
-    # === END: week-level normalization (dedupe + sanity) ===
-
+    # Load scoring weights
     scoring_df = _load_scoring(season)
     weights = _build_weight_config(scoring_df)
 
-    # Compute subtotals with loaded weights
+    # Compute subtotal components
     pts_pass = (
         _safe(wide, "pass_yds") * weights.get("pass_yds", 0.0)
         + _safe(wide, "pass_td") * weights.get("pass_td", 0.0)
         + _safe(wide, "pass_int") * weights.get("pass_int", 0.0)
-        # 2-pt pass placeholder: wide has no column yet
     )
-
     pts_rush = (
         _safe(wide, "rush_yds") * weights.get("rush_yds", 0.0)
         + _safe(wide, "rush_td") * weights.get("rush_td", 0.0)
-        # 2-pt rush placeholder
     )
-
     pts_rec = (
         _safe(wide, "rec_rec") * weights.get("rec_rec", 0.0)
         + _safe(wide, "rec_yds") * weights.get("rec_yds", 0.0)
         + _safe(wide, "rec_td") * weights.get("rec_td", 0.0)
-        # 2-pt rec placeholder
     )
-
-    # Kicking: we can honor XP made; FG distance buckets not available in wide (yet)
     pts_kick = (
         _safe(wide, "xp_made") * weights.get("xp_made", 0.0)
-        # For now, DO NOT credit k_fgm to avoid mis-scoring vs distance buckets.
-        # We will add FG bucket parsing in a follow-up.
     )
-
     pts_misc = _safe(wide, "fum_lost") * weights.get("fum_lost", 0.0)
 
-    # === BEGIN: robust output column selection (position may be missing) ===
-    # Some wide builds don't include 'position'. If it's absent, create a blank column
-    # so downstream joins don't break, but don't force it during grouping.
-    if "position" not in wide.columns:
-        wide["position"] = ""
-
-    # Likewise, ensure required ID columns exist as strings
-    for k in ("team_abbr", "athlete_name"):
-        if k not in wide.columns:
-            wide[k] = ""
-        wide[k] = wide[k].fillna("").astype(str)
-
-    # Build the output DataFrame safely
-    out = wide[[
-        "season", "week", "team_abbr", "athlete_name", "position"
-    ]].copy()
-    # === END: robust output column selection ===
-
+    # Assemble output
+    out = wide[["season", "week", "team_abbr", "athlete_name", "position"]].copy()
     out["pts_pass"] = pts_pass.round(2)
     out["pts_rush"] = pts_rush.round(2)
     out["pts_rec"]  = pts_rec.round(2)
@@ -337,13 +294,28 @@ def main():
     out["pts_misc"] = pts_misc.round(2)
     out["pts_ppr"]  = (out["pts_pass"] + out["pts_rush"] + out["pts_rec"] + out["pts_kick"] + out["pts_misc"]).round(2)
 
+    # Post-scoring quick look (optional)
+    if os.getenv("DEBUG_POINTS", "").strip() == "1":
+        try:
+            print("\n🔎 Top 10 by pts_ppr (post-scoring):")
+            print(out.sort_values("pts_ppr", ascending=False)[
+                ["season","week","team_abbr","athlete_name","position","pts_ppr","pts_pass","pts_rush","pts_rec"]
+            ].head(10).to_string(index=False))
+        except Exception as e:
+            print(f"⚠️ DEBUG pts_ppr failed: {e}")
+
+    # Save
     out_path = ROOT / OUT_POINTS_TPL.format(season=season)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False)
 
     print(f"✅ Wrote {out_path} with {len(out):,} player-week rows.")
-    print("\nSample:")
-    print(out.head(12).to_string(index=False))
+    if os.getenv("DEBUG_POINTS", "").strip() == "1":
+        print("\n🔎 DEBUG sample output:")
+        try:
+            print(out.head(12).to_string(index=False))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
