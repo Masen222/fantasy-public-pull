@@ -238,49 +238,81 @@ def main() -> None:
     out_player_csv.parent.mkdir(parents=True, exist_ok=True)
     league_points.to_csv(out_player_csv, index=False)
 
-    # --- Aggregate to team-week totals
-    def _is_starter(row) -> bool:
-        slot = str(row.get("lineup_slot", "")).strip().upper()
-        if slot in {"BN", "IR"}:
-            return False
-        return True
+    # --- Aggregate to team-week totals (starter-aware, robust) ---
 
-    league_points["__is_starter__"] = league_points.apply(_is_starter, axis=1)
+    # ESPN lineupSlotId canonical starter set:
+    # Keep: QB(0), RB(2), RB/WR(3), WR(4), WR/TE(5), TE(6), K(7), DST(16), FLEX(23), OP/SF(25)
+    # Exclude: BN(20), IR(21), and anything unknown/missing.
+    STARTER_SLOT_IDS = {0, 2, 3, 4, 5, 6, 7, 16, 23, 25}
+
+    # Coerce lineup_slot to numeric IDs (int). Unparsable -> NaN
+    slot_id = pd.to_numeric(league_points.get("lineup_slot", pd.Series([None]*len(league_points))), errors="coerce")
+
+    # Strict starter mask:
+    # - in starter set
+    # - and not UNROSTERED (fantasy_team_id != 0)
+    is_starter = slot_id.isin(STARTER_SLOT_IDS) & (league_points["fantasy_team_id"] != 0)
+    league_points["__is_starter__"] = is_starter.fillna(False)
 
     grp_cols = ["season", "week", "fantasy_team_id", "fantasy_team_name"]
     numeric_pts = ["pts_ppr", "pts_pass", "pts_rush", "pts_rec", "pts_kick", "pts_misc"]
 
-    starters = (
-        league_points[league_points["__is_starter__"] == True]  # noqa: E712
-        .groupby(grp_cols, as_index=False)[numeric_pts]
-        .sum()
-        .rename(columns={c: f"{c}_starters" for c in numeric_pts})
-    )
-
-    all_roster = (
-        league_points.groupby(grp_cols, as_index=False)[numeric_pts]
+    # Totals for ALL players on roster (includes UNROSTERED team 0)
+    tot_all = (
+        league_points.groupby(grp_cols, dropna=False)[numeric_pts]
         .sum()
         .rename(columns={c: f"{c}_all" for c in numeric_pts})
     )
 
-    totals = starters.merge(all_roster, on=grp_cols, how="outer").fillna(0)
+    # Totals for STARTERS only (strict mask)
+    tot_start = (
+        league_points[league_points["__is_starter__"]]
+        .groupby(grp_cols, dropna=False)[numeric_pts]
+        .sum()
+        .rename(columns={c: f"{c}_starters" for c in numeric_pts})
+    )
+
+    # Merge and fill missing starters with 0
+    totals = tot_all.join(tot_start, how="left").fillna(0.0).reset_index()
+
+    # Round for readability
+    for c in totals.columns:
+        if c.startswith("pts_"):
+            totals[c] = totals[c].round(2)
 
     totals_out_cols = grp_cols + [
         "pts_ppr_starters", "pts_pass_starters", "pts_rush_starters", "pts_rec_starters", "pts_kick_starters", "pts_misc_starters",
-        "pts_ppr_all", "pts_pass_all", "pts_rush_all", "pts_rec_all", "pts_kick_all", "pts_misc_all",
+        "pts_ppr_all",      "pts_pass_all",      "pts_rush_all",      "pts_rec_all",      "pts_kick_all",      "pts_misc_all",
     ]
-    totals = totals[totals_out_cols].sort_values(["week", "fantasy_team_name"])
+    totals = totals[totals_out_cols].sort_values(["week", "fantasy_team_id"])
+
+    # DEBUG: show how many starters we counted per team-week
+    try:
+        starters_count = (
+            league_points[league_points["__is_starter__"]]
+            .groupby(grp_cols, dropna=False)["athlete_name"]
+            .size()
+            .rename("starter_rows")
+            .reset_index()
+        )
+        print("\n[DEBUG] Starter rows per team/week (strict slot IDs):")
+        print(starters_count.sort_values(["week","fantasy_team_id"]).head(50).to_string(index=False))
+    except Exception as e:
+        print(f"[DEBUG] Could not compute starters_count: {e}")
 
     totals.to_csv(out_totals_csv, index=False)
 
     # --- Reporting
     print(f"✅ Wrote {out_player_csv} with {len(league_points):,} player-week rows (matched={matched:,}, unmatched={unmatched:,}).")
     print(f"✅ Wrote {out_totals_csv} with {len(totals):,} team-week rows.")
-    print("\nSample player rows:")
+
+    # Print samples defensively (only columns that exist)
     sample_cols = [
         "season","week","fantasy_team_name","team_abbr","athlete_name","position",
-        "pts_ppr","pts_pass","pts_rush","pts_rec","pts_kick","pts_misc","status","lineup_slot"
+        "pts_ppr","pts_pass","pts_rush","pts_rec","pts_kick","pts_misc","lineup_slot","__is_starter__"
     ]
+    sample_cols = [c for c in sample_cols if c in league_points.columns]
+    print("\nSample player rows:")
     print(league_points[sample_cols].head(12).to_string(index=False))
 
     print("\nSample team totals:")

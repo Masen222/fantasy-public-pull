@@ -18,3 +18,13 @@ data/processed/*
 
 # Local ESPN cookie file
 secrets/espn.cookie
+# --- project hygiene ---
+.env
+*.env
+data/processed/
+data/raw/
+**/__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# macOS
+.DS_Store
