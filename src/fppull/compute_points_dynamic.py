@@ -183,12 +183,12 @@ def main():
     wide = pd.read_csv(wide_path)
 
     # === BEGIN: week-level normalization (dedupe + sanity) ===
-    # Goal: ensure ONE row per (season, week, player) before computing points.
-    # This prevents inflated totals when the "wide" source contains duplicate
-    # rows (e.g., multiple stat snapshots, merges, or season-to-date artifacts).
+    # Goal: ensure ONE row per (season, week, team_abbr, athlete_name) before computing points.
+    # Many feeds are cumulative/incremental; taking MAX per stat per player-week
+    # matches the final box total and prevents overcounting.
 
-    # 1) Identify the key and the numeric stat columns we care about
-    _key = ["season", "week", "team_abbr", "athlete_name", "position"]
+    # 1) Identify key + numeric columns
+    _key = ["season", "week", "team_abbr", "athlete_name"]  # don't include 'position' here
     _numeric_cols = [
         # passing
         "pass_yds", "pass_td", "pass_int",
@@ -202,30 +202,43 @@ def main():
         "xp_made", "xp_att", "k_fgm", "k_fga",
     ]
 
+    # Ensure required columns exist
     for c in _numeric_cols:
         if c not in wide.columns:
             wide[c] = 0.0
 
-    # 2) Coerce numeric columns safely
+    # Make sure ID columns exist and are strings
+    for k in _key:
+        if k not in wide.columns:
+            wide[k] = ""
+        wide[k] = wide[k].fillna("").astype(str)
+
+    # Coerce numeric for stable max()
     for c in _numeric_cols:
         wide[c] = pd.to_numeric(wide[c], errors="coerce").fillna(0.0)
 
-    # 3) Group to one row per player-week and SUM numeric stats
-    #    (If your source was already unique, this is a no-op.)
-    wide = (
-        wide.groupby(_key, as_index=False)[_numeric_cols]
-            .sum()
-    )
+    # 2) Collapse to one row per player-week using MAX across duplicates
+    try:
+        wide = (
+            wide.groupby(_key, as_index=False, dropna=False)[_numeric_cols]
+                .max()
+        )
+    except TypeError:
+        # Older pandas without dropna=; keys have no NaN due to fillna above.
+        wide = (
+            wide.groupby(_key, as_index=False)[_numeric_cols]
+                .max()
+        )
 
-    # 4) Sanity warnings (non-fatal): flag impossible lines to guide upstream fixes
+    # 3) Sanity warnings (non-fatal)
     _suspicious = wide[
-        (wide["rec_yds"] > 300) |
-        (wide["rec_rec"] > 25)  |
-        (wide["rush_yds"] > 300)|
-        (wide["pass_yds"] > 700)
+        (("rec_yds"  in wide.columns) & (wide["rec_yds"]  > 300)) |
+        (("rec_rec"  in wide.columns) & (wide["rec_rec"]  > 25))  |
+        (("rush_yds" in wide.columns) & (wide["rush_yds"] > 300)) |
+        (("pass_yds" in wide.columns) & (wide["pass_yds"] > 700))
     ]
     if len(_suspicious) > 0:
-        print(f"⚠️  Sanity: {len(_suspicious)} player-week rows exceed plausible ranges. Example:")
+        print(f"⚠️  Sanity: {len(_suspicious)} player-week rows exceed plausible ranges after MAX-normalization. Example:")
         try:
             print(_suspicious[_key + ["pass_yds","rush_yds","rec_rec","rec_yds"]].head(8).to_string(index=False))
         except Exception:
@@ -265,9 +278,23 @@ def main():
 
     pts_misc = _safe(wide, "fum_lost") * weights.get("fum_lost", 0.0)
 
+    # === BEGIN: robust output column selection (position may be missing) ===
+    # Some wide builds don't include 'position'. If it's absent, create a blank column
+    # so downstream joins don't break, but don't force it during grouping.
+    if "position" not in wide.columns:
+        wide["position"] = ""
+
+    # Likewise, ensure required ID columns exist as strings
+    for k in ("team_abbr", "athlete_name"):
+        if k not in wide.columns:
+            wide[k] = ""
+        wide[k] = wide[k].fillna("").astype(str)
+
+    # Build the output DataFrame safely
     out = wide[[
         "season", "week", "team_abbr", "athlete_name", "position"
     ]].copy()
+    # === END: robust output column selection ===
 
     out["pts_pass"] = pts_pass.round(2)
     out["pts_rush"] = pts_rush.round(2)
